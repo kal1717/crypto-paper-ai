@@ -1,0 +1,46 @@
+name: Crypto Paper Trader
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  run-paper-trader:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore paper database cache
+        uses: actions/cache@v4
+        with:
+          path: paper_trader.sqlite3
+          key: paper-trader-db-${{ github.run_id }}
+          restore-keys: |
+            paper-trader-db-
+
+      - name: Run one paper-trading cycle
+        run: python paper_ai.py --once
+
+      - name: Print portfolio summary
+        if: always()
+        run: python paper_ai.py --summary
+
+      - name: Upload paper database snapshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: paper-trader-db
+          path: paper_trader.sqlite3
+          retention-days: 30
