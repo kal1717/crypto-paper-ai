@@ -11,10 +11,11 @@ live-handel.
 
 - Hamter publika priser fran CoinGecko.
 - Sparar priser, fiktiva affarer, portfolj och modellvikter i SQLite.
-- Borjar med fiktivt kapital enligt `config.example.json`.
+- Borjar med 100 fiktiva USDT enligt `config.example.json`.
 - Gor sma kop/salj/hall-beslut med en enkel online-modell.
 - Blandar in lite utforskning sa den provar olika beslut och kan lara sig.
-- Har riskregler for max position, stop-loss och take-profit.
+- Har riskregler for max 2 oppna positioner, 10% portfoljvarde per position,
+  stop-loss pa -15% och take-profit.
 
 ## Starta
 
@@ -76,9 +77,10 @@ Projektet innehaller en GitHub Actions-workflow i
 
 Nar projektet ligger i ett GitHub-repo kor workflowen:
 
-- automatiskt var 30:e minut
+- automatiskt var 5:e minut
 - manuellt via fliken **Actions** och **Run workflow**
-- `python paper_ai.py --once` for ett paper-trading-varv
+- `python paper_ai.py --cycles 5` for fem beslut med 60 sekunder mellan varje
+  beslut
 - `python paper_ai.py --summary` efterat
 
 Databasen `paper_trader.sqlite3` sparas mellan korningar med GitHub Actions
@@ -95,3 +97,7 @@ git commit -m "Add crypto paper trading AI"
 
 Skapa sedan ett nytt repo pa GitHub och folj instruktionerna dar for att pusha
 projektet.
+
+Obs: GitHub Actions kan inte starta schemalagda workflows exakt varje minut.
+GitHubs kortaste schemaintervall ar 5 minuter, sa workflowen kor fem
+1-minuterscykler inne i varje jobb.

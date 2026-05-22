@@ -34,6 +34,7 @@ USER_AGENT = "crypto-paper-ai/0.1 paper-trading research"
 class SymbolConfig:
     coin_id: str
     symbol: str
+    market_symbol: str | None = None
 
 
 @dataclass
@@ -97,6 +98,35 @@ class CoinGeckoFeed:
                     coin_id=item.coin_id,
                     symbol=item.symbol.upper(),
                     price=float(price),
+                    ts=now,
+                )
+            )
+        return snapshots
+
+
+class BinanceFeed:
+    def prices(self, symbols: list[SymbolConfig]) -> list[MarketSnapshot]:
+        market_symbols = [
+            item.market_symbol or f"{item.symbol.upper()}USDT" for item in symbols
+        ]
+        params = urllib.parse.urlencode(
+            {"symbols": json.dumps(market_symbols, separators=(",", ":"))}
+        )
+        url = f"https://api.binance.com/api/v3/ticker/price?{params}"
+        payload = http_json(url)
+        prices = {item["symbol"]: float(item["price"]) for item in payload}
+        now = utc_now()
+        snapshots: list[MarketSnapshot] = []
+        for item in symbols:
+            market_symbol = item.market_symbol or f"{item.symbol.upper()}USDT"
+            price = prices.get(market_symbol)
+            if price is None:
+                continue
+            snapshots.append(
+                MarketSnapshot(
+                    coin_id=item.coin_id,
+                    symbol=item.symbol.upper(),
+                    price=price,
                     ts=now,
                 )
             )
@@ -330,6 +360,12 @@ class Store:
             )
         return {"cash": self.cash(), "portfolio_value": value, "positions": open_positions}
 
+    def open_position_count(self) -> int:
+        row = self.db.execute(
+            "SELECT COUNT(*) AS count FROM positions WHERE quantity > 0"
+        ).fetchone()
+        return int(row["count"]) if row else 0
+
 
 class Learner:
     def __init__(self, config: dict[str, Any]) -> None:
@@ -420,19 +456,34 @@ class PaperBroker:
         quantity, avg_entry = self.store.position(snapshot.symbol)
         fee_rate = float(self.config.get("fee_rate", 0.001))
         slippage_rate = float(self.config.get("slippage_rate", 0.0005))
-        trade_fraction = float(self.config.get("trade_fraction", 0.05))
-        max_position_fraction = float(self.config.get("max_position_fraction", 0.35))
+        position_fraction = float(self.config.get("position_fraction", 0.10))
+        max_open_positions = int(self.config.get("max_open_positions", 2))
 
         summary = self.store.summary()
         portfolio_value = float(summary["portfolio_value"])
         position_value = quantity * snapshot.price
-        max_position_value = portfolio_value * max_position_fraction
+        target_position_value = portfolio_value * position_fraction
 
         if decision.action == "BUY":
-            budget = min(cash * trade_fraction, max(0.0, max_position_value - position_value))
+            if quantity <= 0 and self.store.open_position_count() >= max_open_positions:
+                self.store.record_trade(
+                    snapshot.symbol,
+                    "HOLD",
+                    0.0,
+                    snapshot.price,
+                    decision.confidence,
+                    "buy skipped: max open positions",
+                )
+                return
+            budget = min(cash, max(0.0, target_position_value - position_value))
             if budget <= 1.0:
                 self.store.record_trade(
-                    snapshot.symbol, "HOLD", 0.0, snapshot.price, decision.confidence, "buy skipped: budget/risk cap"
+                    snapshot.symbol,
+                    "HOLD",
+                    0.0,
+                    snapshot.price,
+                    decision.confidence,
+                    "buy skipped: budget/risk cap",
                 )
                 return
             fill_price = snapshot.price * (1.0 + slippage_rate)
@@ -452,7 +503,7 @@ class PaperBroker:
             return
 
         if decision.action == "SELL":
-            sell_quantity = quantity * trade_fraction
+            sell_quantity = quantity
             if sell_quantity <= 0:
                 self.store.record_trade(
                     snapshot.symbol, "HOLD", 0.0, snapshot.price, decision.confidence, "sell skipped: no position"
@@ -480,12 +531,16 @@ class PaperBroker:
 
 def parse_symbols(config: dict[str, Any]) -> list[SymbolConfig]:
     return [
-        SymbolConfig(coin_id=item["id"], symbol=item["symbol"])
+        SymbolConfig(
+            coin_id=item["id"],
+            symbol=item["symbol"],
+            market_symbol=item.get("market_symbol"),
+        )
         for item in config.get("symbols", [])
     ]
 
 
-def run_once(store: Store, feed: CoinGeckoFeed, learner: Learner, broker: PaperBroker, symbols: list[SymbolConfig]) -> None:
+def run_once(store: Store, feed: Any, learner: Learner, broker: PaperBroker, symbols: list[SymbolConfig]) -> None:
     snapshots = feed.prices(symbols)
     for snapshot in snapshots:
         store.insert_price(snapshot)
@@ -520,6 +575,7 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
     parser.add_argument("--once", action="store_true", help="Run one market check and exit")
+    parser.add_argument("--cycles", type=int, default=None, help="Run this many market checks and exit")
     parser.add_argument("--summary", action="store_true", help="Print portfolio summary and exit")
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
@@ -537,15 +593,18 @@ def main() -> int:
         print_summary(store)
         return 0
 
-    feed = CoinGeckoFeed(config.get("quote_currency", "USD"))
+    provider = config.get("market_data", {}).get("provider", "coingecko")
+    feed = BinanceFeed() if provider == "binance" else CoinGeckoFeed(config.get("quote_currency", "USD"))
     learner = Learner(config)
     broker = PaperBroker(store, config)
 
     try:
+        cycle = 0
         while True:
             run_once(store, feed, learner, broker, symbols)
             print_summary(store)
-            if args.once:
+            cycle += 1
+            if args.once or (args.cycles is not None and cycle >= args.cycles):
                 return 0
             time.sleep(int(config.get("poll_seconds", 60)))
     except urllib.error.URLError as exc:

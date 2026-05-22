@@ -3,7 +3,7 @@ name: Crypto Paper Trader
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/5 * * * *"
 
 permissions:
   contents: read
@@ -14,7 +14,10 @@ env:
 jobs:
   run-paper-trader:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 8
+    concurrency:
+      group: crypto-paper-trader
+      cancel-in-progress: false
 
     steps:
       - name: Check out repository
@@ -33,8 +36,8 @@ jobs:
           restore-keys: |
             paper-trader-db-
 
-      - name: Run one paper-trading cycle
-        run: python paper_ai.py --once
+      - name: Run five one-minute paper-trading cycles
+        run: python paper_ai.py --cycles 5
 
       - name: Print portfolio summary
         if: always()
