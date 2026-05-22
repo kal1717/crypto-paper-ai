@@ -43,6 +43,10 @@ class MarketSnapshot:
     symbol: str
     price: float
     ts: int
+    quote_volume: float = 0.0
+    price_change_pct_24h: float = 0.0
+    high_24h: float = 0.0
+    low_24h: float = 0.0
 
 
 @dataclass
@@ -63,6 +67,13 @@ def sigmoid(value: float) -> float:
     if value > 35:
         return 1.0
     return 1.0 / (1.0 + math.exp(-value))
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -107,6 +118,12 @@ class CoinGeckoFeed:
 class BinanceFeed:
     def __init__(self, quote_currency: str = "USDT") -> None:
         self.quote_currency = quote_currency.upper()
+        self.ticker_24h: dict[str, dict[str, Any]] = {}
+
+    def load_24h_tickers(self) -> list[dict[str, Any]]:
+        payload = http_json("https://api.binance.com/api/v3/ticker/24hr")
+        self.ticker_24h = {item.get("symbol", ""): item for item in payload}
+        return payload
 
     def universe(self, config: dict[str, Any], store: "Store") -> list[SymbolConfig]:
         universe = config.get("universe", {})
@@ -116,8 +133,7 @@ class BinanceFeed:
         top_n = int(universe.get("top_n", 50))
         excluded = set(universe.get("exclude_base_symbols", []))
         excluded_suffixes = tuple(universe.get("exclude_suffixes", []))
-        url = "https://api.binance.com/api/v3/ticker/24hr"
-        payload = http_json(url)
+        payload = self.load_24h_tickers()
         candidates: list[tuple[float, SymbolConfig]] = []
 
         for item in payload:
@@ -164,6 +180,8 @@ class BinanceFeed:
     def prices(self, symbols: list[SymbolConfig]) -> list[MarketSnapshot]:
         if not symbols:
             return []
+        if not self.ticker_24h:
+            self.load_24h_tickers()
         market_symbols = [
             item.market_symbol or f"{item.symbol.upper()}USDT" for item in symbols
         ]
@@ -182,12 +200,17 @@ class BinanceFeed:
             price = prices.get(market_symbol)
             if price is None:
                 continue
+            ticker = self.ticker_24h.get(market_symbol, {})
             snapshots.append(
                 MarketSnapshot(
                     coin_id=item.coin_id,
                     symbol=item.symbol.upper(),
                     price=price,
                     ts=now,
+                    quote_volume=safe_float(ticker.get("quoteVolume")),
+                    price_change_pct_24h=safe_float(ticker.get("priceChangePercent")),
+                    high_24h=safe_float(ticker.get("highPrice")),
+                    low_24h=safe_float(ticker.get("lowPrice")),
                 )
             )
         return snapshots
@@ -209,7 +232,11 @@ class Store:
                 ts INTEGER NOT NULL,
                 coin_id TEXT NOT NULL,
                 symbol TEXT NOT NULL,
-                price REAL NOT NULL
+                price REAL NOT NULL,
+                quote_volume REAL NOT NULL DEFAULT 0,
+                price_change_pct_24h REAL NOT NULL DEFAULT 0,
+                high_24h REAL NOT NULL DEFAULT 0,
+                low_24h REAL NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS positions (
@@ -244,6 +271,7 @@ class Store:
             );
             """
         )
+        self.migrate()
         quote = self.config.get("quote_currency", "USD").upper()
         existing = self.db.execute(
             "SELECT amount FROM cash WHERE currency = ?", (quote,)
@@ -255,10 +283,41 @@ class Store:
             )
         self.db.commit()
 
+    def migrate(self) -> None:
+        columns = {
+            row["name"]
+            for row in self.db.execute("PRAGMA table_info(prices)").fetchall()
+        }
+        migrations = {
+            "quote_volume": "ALTER TABLE prices ADD COLUMN quote_volume REAL NOT NULL DEFAULT 0",
+            "price_change_pct_24h": "ALTER TABLE prices ADD COLUMN price_change_pct_24h REAL NOT NULL DEFAULT 0",
+            "high_24h": "ALTER TABLE prices ADD COLUMN high_24h REAL NOT NULL DEFAULT 0",
+            "low_24h": "ALTER TABLE prices ADD COLUMN low_24h REAL NOT NULL DEFAULT 0",
+        }
+        for column, statement in migrations.items():
+            if column not in columns:
+                self.db.execute(statement)
+        self.db.commit()
+
     def insert_price(self, snapshot: MarketSnapshot) -> None:
         self.db.execute(
-            "INSERT INTO prices(ts, coin_id, symbol, price) VALUES(?, ?, ?, ?)",
-            (snapshot.ts, snapshot.coin_id, snapshot.symbol, snapshot.price),
+            """
+            INSERT INTO prices(
+                ts, coin_id, symbol, price, quote_volume,
+                price_change_pct_24h, high_24h, low_24h
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot.ts,
+                snapshot.coin_id,
+                snapshot.symbol,
+                snapshot.price,
+                snapshot.quote_volume,
+                snapshot.price_change_pct_24h,
+                snapshot.high_24h,
+                snapshot.low_24h,
+            ),
         )
         self.db.commit()
 
@@ -274,6 +333,19 @@ class Store:
             (symbol, limit),
         ).fetchall()
         return [float(row["price"]) for row in reversed(rows)]
+
+    def recent_market_rows(self, symbol: str, limit: int = 80) -> list[sqlite3.Row]:
+        rows = self.db.execute(
+            """
+            SELECT price, quote_volume, price_change_pct_24h, high_24h, low_24h
+            FROM prices
+            WHERE symbol = ?
+            ORDER BY ts DESC, id DESC
+            LIMIT ?
+            """,
+            (symbol, limit),
+        ).fetchall()
+        return list(reversed(rows))
 
     def cash(self) -> float:
         quote = self.config.get("quote_currency", "USD").upper()
@@ -320,7 +392,12 @@ class Store:
                     "ret_1": 0.0,
                     "ret_3": 0.0,
                     "ret_8": 0.0,
+                    "ret_21": 0.0,
                     "vol_8": 0.0,
+                    "rsi_14": 0.0,
+                    "range_position_24h": 0.0,
+                    "volume_change_5": 0.0,
+                    "market_change_24h": 0.0,
                     "position": 0.0,
                 },
                 "last_features": None,
@@ -432,16 +509,135 @@ class Store:
         ).fetchall()
         return [str(row["symbol"]) for row in rows]
 
+    def report(self) -> dict[str, Any]:
+        summary = self.summary()
+        trade_rows = self.db.execute(
+            """
+            SELECT ts, symbol, action, quantity, price, cash_after, confidence, reason
+            FROM trades
+            WHERE action IN ('BUY', 'SELL')
+            ORDER BY id
+            """
+        ).fetchall()
+        round_trips: list[dict[str, Any]] = []
+        lots: dict[str, list[dict[str, float]]] = {}
+
+        for row in trade_rows:
+            symbol = str(row["symbol"])
+            action = str(row["action"])
+            quantity = float(row["quantity"])
+            price = float(row["price"])
+            if quantity <= 0:
+                continue
+            if action == "BUY":
+                lots.setdefault(symbol, []).append(
+                    {"quantity": quantity, "price": price, "ts": float(row["ts"])}
+                )
+                continue
+            remaining = quantity
+            symbol_lots = lots.setdefault(symbol, [])
+            while remaining > 0 and symbol_lots:
+                lot = symbol_lots[0]
+                matched = min(remaining, lot["quantity"])
+                pnl = (price - lot["price"]) * matched
+                pnl_pct = (price / lot["price"]) - 1.0 if lot["price"] > 0 else 0.0
+                round_trips.append(
+                    {
+                        "symbol": symbol,
+                        "quantity": matched,
+                        "entry": lot["price"],
+                        "exit": price,
+                        "pnl": pnl,
+                        "pnl_pct": pnl_pct,
+                        "entry_ts": int(lot["ts"]),
+                        "exit_ts": int(row["ts"]),
+                    }
+                )
+                lot["quantity"] -= matched
+                remaining -= matched
+                if lot["quantity"] <= 1e-12:
+                    symbol_lots.pop(0)
+
+        realized_pnl = sum(item["pnl"] for item in round_trips)
+        winners = [item for item in round_trips if item["pnl"] > 0]
+        losers = [item for item in round_trips if item["pnl"] < 0]
+        best = max(round_trips, key=lambda item: item["pnl_pct"], default=None)
+        worst = min(round_trips, key=lambda item: item["pnl_pct"], default=None)
+        buys = sum(1 for row in trade_rows if row["action"] == "BUY")
+        sells = sum(1 for row in trade_rows if row["action"] == "SELL")
+
+        return {
+            "cash": summary["cash"],
+            "portfolio_value": summary["portfolio_value"],
+            "open_positions": summary["positions"],
+            "trade_count": len(trade_rows),
+            "buy_count": buys,
+            "sell_count": sells,
+            "closed_positions": len(round_trips),
+            "win_rate": (len(winners) / len(round_trips)) if round_trips else 0.0,
+            "realized_pnl": realized_pnl,
+            "avg_closed_pnl_pct": (
+                sum(item["pnl_pct"] for item in round_trips) / len(round_trips)
+                if round_trips
+                else 0.0
+            ),
+            "best_closed_trade": best,
+            "worst_closed_trade": worst,
+        }
+
 
 class Learner:
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
 
-    def features(self, prices: list[float], position_value: float, portfolio: float) -> dict[str, float]:
+    def features(
+        self,
+        rows: list[sqlite3.Row],
+        position_value: float,
+        portfolio: float,
+    ) -> dict[str, float]:
+        prices = [float(row["price"]) for row in rows]
         def ret(period: int) -> float:
             if len(prices) <= period or prices[-period - 1] <= 0:
                 return 0.0
             return (prices[-1] / prices[-period - 1]) - 1.0
+
+        def rsi(period: int = 14) -> float:
+            if len(prices) <= period:
+                return 0.0
+            gains = []
+            losses = []
+            for i in range(len(prices) - period, len(prices)):
+                change = prices[i] - prices[i - 1]
+                if change >= 0:
+                    gains.append(change)
+                    losses.append(0.0)
+                else:
+                    gains.append(0.0)
+                    losses.append(abs(change))
+            avg_gain = sum(gains) / period
+            avg_loss = sum(losses) / period
+            if avg_loss == 0:
+                return 1.0
+            value = 100.0 - (100.0 / (1.0 + (avg_gain / avg_loss)))
+            return (value - 50.0) / 50.0
+
+        def volume_change(period: int = 5) -> float:
+            if len(rows) <= period:
+                return 0.0
+            current = float(rows[-1]["quote_volume"])
+            previous = float(rows[-period - 1]["quote_volume"])
+            if previous <= 0:
+                return 0.0
+            return max(-5.0, min(5.0, (current / previous) - 1.0))
+
+        latest = rows[-1] if rows else None
+        high_24h = float(latest["high_24h"]) if latest else 0.0
+        low_24h = float(latest["low_24h"]) if latest else 0.0
+        current_price = prices[-1] if prices else 0.0
+        range_position = 0.0
+        if high_24h > low_24h and current_price > 0:
+            range_position = ((current_price - low_24h) / (high_24h - low_24h)) - 0.5
 
         returns = []
         for i in range(max(1, len(prices) - 8), len(prices)):
@@ -458,7 +654,14 @@ class Learner:
             "ret_1": ret(1) * 100.0,
             "ret_3": ret(3) * 100.0,
             "ret_8": ret(8) * 100.0,
+            "ret_21": ret(21) * 100.0,
             "vol_8": math.sqrt(variance) * 100.0,
+            "rsi_14": rsi(14),
+            "range_position_24h": range_position,
+            "volume_change_5": volume_change(5),
+            "market_change_24h": (float(latest["price_change_pct_24h"]) / 100.0)
+            if latest
+            else 0.0,
             "position": (position_value / portfolio) if portfolio > 0 else 0.0,
         }
 
@@ -615,7 +818,7 @@ def run_once(store: Store, feed: Any, learner: Learner, broker: PaperBroker, con
         quantity, avg_entry = store.position(snapshot.symbol)
         summary = store.summary()
         portfolio = float(summary["portfolio_value"])
-        prices = store.recent_prices(snapshot.symbol)
+        rows = store.recent_market_rows(snapshot.symbol)
         state = store.model_state(snapshot.symbol)
         weights = learner.update(
             state["weights"],
@@ -623,7 +826,7 @@ def run_once(store: Store, feed: Any, learner: Learner, broker: PaperBroker, con
             state["last_price"],
             snapshot.price,
         )
-        feature_set = learner.features(prices, quantity * snapshot.price, portfolio)
+        feature_set = learner.features(rows, quantity * snapshot.price, portfolio)
         decision = learner.decide(weights, feature_set, avg_entry, snapshot.price)
         executed_action, executed_reason = broker.execute(snapshot, decision)
         store.save_model(snapshot.symbol, weights, feature_set, snapshot.price)
@@ -638,6 +841,10 @@ def print_summary(store: Store) -> None:
     print(json.dumps(summary, indent=2, sort_keys=True))
 
 
+def print_report(store: Store) -> None:
+    print(json.dumps(store.report(), indent=2, sort_keys=True))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Paper-trading crypto learner")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
@@ -645,6 +852,7 @@ def main() -> int:
     parser.add_argument("--once", action="store_true", help="Run one market check and exit")
     parser.add_argument("--cycles", type=int, default=None, help="Run this many market checks and exit")
     parser.add_argument("--summary", action="store_true", help="Print portfolio summary and exit")
+    parser.add_argument("--report", action="store_true", help="Print learning/trading report and exit")
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
@@ -656,6 +864,9 @@ def main() -> int:
         raise SystemExit("No symbols configured.")
 
     store = Store(args.db, config)
+    if args.report:
+        print_report(store)
+        return 0
     if args.summary:
         print_summary(store)
         return 0

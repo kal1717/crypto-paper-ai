@@ -43,6 +43,10 @@ jobs:
         if: always()
         run: python paper_ai.py --summary
 
+      - name: Print learning report
+        if: always()
+        run: python paper_ai.py --report
+
       - name: Upload paper database snapshot
         if: always()
         uses: actions/upload-artifact@v4

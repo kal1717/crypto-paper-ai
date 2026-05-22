@@ -15,6 +15,9 @@ live-handel.
 - Gor sma kop/salj/hall-beslut med en enkel online-modell.
 - Blandar in lite utforskning sa den provar olika beslut och kan lara sig.
 - Skannar topp 50 USDT-par pa Binance efter handelsvolym.
+- Lagrar pris, 24h-volym, 24h-forandring samt high/low for varje snapshot.
+- Lagger till features for momentum, volatilitet, RSI, volymforandring och
+  var priset ligger i sitt 24h-intervall.
 - Har riskregler for max 2 oppna positioner, 10% portfoljvarde per position,
   stop-loss pa -15% och take-profit.
 - Fortsatter bevaka oppna positioner aven om de tillfalligt hamnar utanfor topp
@@ -39,6 +42,12 @@ Visa portfolj:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\run.ps1 --summary
+```
+
+Visa handels- och larrapport:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run.ps1 --report
 ```
 
 ## Konfiguration
@@ -86,6 +95,7 @@ Nar projektet ligger i ett GitHub-repo kor workflowen:
 - `python paper_ai.py --cycles 5` for fem beslut med 60 sekunder mellan varje
   beslut
 - `python paper_ai.py --summary` efterat
+- `python paper_ai.py --report` efterat
 
 Databasen `paper_trader.sqlite3` sparas mellan korningar med GitHub Actions
 cache och laddas dessutom upp som artifact i 30 dagar sa du kan granska den.
