@@ -89,19 +89,99 @@ def http_json(url: str, timeout: int = 20) -> Any:
 
 class CoinGeckoFeed:
     def __init__(self, quote_currency: str) -> None:
-        self.quote_currency = quote_currency.lower()
+        self.quote_currency = quote_currency.upper()
+        self.vs_currency = "usd" if self.quote_currency == "USDT" else quote_currency.lower()
+        self.market_data: dict[str, dict[str, Any]] = {}
+
+    def load_markets(self, top_n: int) -> list[dict[str, Any]]:
+        params = urllib.parse.urlencode(
+            {
+                "vs_currency": self.vs_currency,
+                "order": "volume_desc",
+                "per_page": top_n,
+                "page": 1,
+                "sparkline": "false",
+                "price_change_percentage": "24h",
+            }
+        )
+        payload = http_json(f"https://api.coingecko.com/api/v3/coins/markets?{params}")
+        self.market_data = {item.get("id", ""): item for item in payload}
+        return payload
+
+    def universe(self, config: dict[str, Any], store: "Store") -> list[SymbolConfig]:
+        universe = config.get("universe", {})
+        if universe.get("mode") != "coingecko_top_volume":
+            return parse_symbols(config)
+
+        top_n = int(universe.get("top_n", 50))
+        excluded = set(universe.get("exclude_base_symbols", []))
+        markets = self.load_markets(top_n + len(excluded) + 20)
+        selected: list[SymbolConfig] = []
+        for item in markets:
+            symbol = str(item.get("symbol", "")).upper()
+            if not symbol or symbol in excluded:
+                continue
+            selected.append(
+                SymbolConfig(
+                    coin_id=str(item.get("id", "")),
+                    symbol=symbol,
+                    market_symbol=symbol + self.quote_currency,
+                )
+            )
+            if len(selected) >= top_n:
+                break
+
+        by_symbol = {item.symbol: item for item in selected}
+        for open_symbol in store.open_symbols():
+            by_symbol.setdefault(
+                open_symbol,
+                SymbolConfig(
+                    coin_id=open_symbol.lower(),
+                    symbol=open_symbol,
+                    market_symbol=f"{open_symbol}{self.quote_currency}",
+                ),
+            )
+        return list(by_symbol.values())
 
     def prices(self, symbols: list[SymbolConfig]) -> list[MarketSnapshot]:
+        if not symbols:
+            return []
+        if self.market_data:
+            now = utc_now()
+            snapshots: list[MarketSnapshot] = []
+            for item in symbols:
+                market = self.market_data.get(item.coin_id)
+                if not market:
+                    continue
+                price = safe_float(market.get("current_price"))
+                if price <= 0:
+                    continue
+                snapshots.append(
+                    MarketSnapshot(
+                        coin_id=item.coin_id,
+                        symbol=item.symbol.upper(),
+                        price=price,
+                        ts=now,
+                        quote_volume=safe_float(market.get("total_volume")),
+                        price_change_pct_24h=safe_float(
+                            market.get("price_change_percentage_24h")
+                        ),
+                        high_24h=safe_float(market.get("high_24h")),
+                        low_24h=safe_float(market.get("low_24h")),
+                    )
+                )
+            return snapshots
+
         ids = ",".join(item.coin_id for item in symbols)
         params = urllib.parse.urlencode(
-            {"ids": ids, "vs_currencies": self.quote_currency}
+            {"ids": ids, "vs_currencies": self.vs_currency}
         )
         url = f"https://api.coingecko.com/api/v3/simple/price?{params}"
         payload = http_json(url)
         now = utc_now()
         snapshots: list[MarketSnapshot] = []
         for item in symbols:
-            price = payload.get(item.coin_id, {}).get(self.quote_currency)
+            price = payload.get(item.coin_id, {}).get(self.vs_currency)
             if price is None:
                 continue
             snapshots.append(
@@ -860,7 +940,11 @@ def main() -> int:
         random.seed(args.seed)
 
     config = load_config(args.config)
-    if not parse_symbols(config) and config.get("universe", {}).get("mode") != "binance_top_volume":
+    universe_mode = config.get("universe", {}).get("mode")
+    if not parse_symbols(config) and universe_mode not in {
+        "binance_top_volume",
+        "coingecko_top_volume",
+    }:
         raise SystemExit("No symbols configured.")
 
     store = Store(args.db, config)

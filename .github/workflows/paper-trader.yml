@@ -32,9 +32,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: paper_trader.sqlite3
-          key: paper-trader-db-${{ github.run_id }}
+          key: paper-trader-db-v2-${{ github.run_id }}
           restore-keys: |
-            paper-trader-db-
+            paper-trader-db-v2-
 
       - name: Run five one-minute paper-trading cycles
         run: python paper_ai.py --cycles 5

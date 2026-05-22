@@ -9,12 +9,13 @@ live-handel.
 
 ## Vad den gor
 
-- Hamter publika USDT-priser fran Binance.
+- Hamter publika topp-50 marknadsdata fran CoinGecko for att fungera stabilt
+  pa GitHub Actions.
 - Sparar priser, fiktiva affarer, portfolj och modellvikter i SQLite.
 - Borjar med 100 fiktiva USDT enligt `config.example.json`.
 - Gor sma kop/salj/hall-beslut med en enkel online-modell.
 - Blandar in lite utforskning sa den provar olika beslut och kan lara sig.
-- Skannar topp 50 USDT-par pa Binance efter handelsvolym.
+- Skannar topp 50 kryptomarknader efter handelsvolym.
 - Lagrar pris, 24h-volym, 24h-forandring samt high/low for varje snapshot.
 - Lagger till features for momentum, volatilitet, RSI, volymforandring och
   var priset ligger i sitt 24h-intervall.
@@ -67,7 +68,7 @@ Viktiga falt:
 - `exploration_rate`: hur ofta agenten testar slumpmassiga beslut for att lara sig.
 - `learning_rate`: hur snabbt modellen justerar sig efter nya prisrorelser.
 - `symbols`: CoinGecko-id och kort symbol for marknader att bevaka.
-- `universe.top_n`: hur manga Binance USDT-par som ska skannas.
+- `universe.top_n`: hur manga marknader som ska skannas.
 
 ## Vagen mot live-handel
 

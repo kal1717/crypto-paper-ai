@@ -9,12 +9,13 @@
   "exploration_rate": 0.12,
   "learning_rate": 0.08,
   "market_data": {
-    "provider": "binance"
+    "provider": "coingecko"
   },
   "universe": {
-    "mode": "binance_top_volume",
+    "mode": "coingecko_top_volume",
     "top_n": 50,
     "exclude_base_symbols": [
+      "USDT",
       "USDC",
       "FDUSD",
       "TUSD",
@@ -22,6 +23,14 @@
       "USDE",
       "USD1",
       "RLUSD",
+      "PYUSD",
+      "RUSD",
+      "USDG",
+      "USDD",
+      "BUSD",
+      "FRAX",
+      "GUSD",
+      "LUSD",
       "DAI",
       "U",
       "EUR",
