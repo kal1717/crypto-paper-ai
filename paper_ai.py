@@ -105,16 +105,76 @@ class CoinGeckoFeed:
 
 
 class BinanceFeed:
+    def __init__(self, quote_currency: str = "USDT") -> None:
+        self.quote_currency = quote_currency.upper()
+
+    def universe(self, config: dict[str, Any], store: "Store") -> list[SymbolConfig]:
+        universe = config.get("universe", {})
+        if universe.get("mode") != "binance_top_volume":
+            return parse_symbols(config)
+
+        top_n = int(universe.get("top_n", 50))
+        excluded = set(universe.get("exclude_base_symbols", []))
+        excluded_suffixes = tuple(universe.get("exclude_suffixes", []))
+        url = "https://api.binance.com/api/v3/ticker/24hr"
+        payload = http_json(url)
+        candidates: list[tuple[float, SymbolConfig]] = []
+
+        for item in payload:
+            market_symbol = item.get("symbol", "")
+            if not market_symbol.endswith(self.quote_currency):
+                continue
+            base_symbol = market_symbol[: -len(self.quote_currency)]
+            if not base_symbol.isascii() or not base_symbol.isalnum():
+                continue
+            if base_symbol in excluded or base_symbol.endswith(excluded_suffixes):
+                continue
+            try:
+                quote_volume = float(item.get("quoteVolume", 0.0))
+                last_price = float(item.get("lastPrice", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if quote_volume <= 0 or last_price <= 0:
+                continue
+            candidates.append(
+                (
+                    quote_volume,
+                    SymbolConfig(
+                        coin_id=base_symbol.lower(),
+                        symbol=base_symbol,
+                        market_symbol=market_symbol,
+                    ),
+                )
+            )
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        selected = [item[1] for item in candidates[:top_n]]
+        by_symbol = {item.symbol: item for item in selected}
+        for open_symbol in store.open_symbols():
+            by_symbol.setdefault(
+                open_symbol,
+                SymbolConfig(
+                    coin_id=open_symbol.lower(),
+                    symbol=open_symbol,
+                    market_symbol=f"{open_symbol}{self.quote_currency}",
+                ),
+            )
+        return list(by_symbol.values())
+
     def prices(self, symbols: list[SymbolConfig]) -> list[MarketSnapshot]:
+        if not symbols:
+            return []
         market_symbols = [
             item.market_symbol or f"{item.symbol.upper()}USDT" for item in symbols
         ]
-        params = urllib.parse.urlencode(
-            {"symbols": json.dumps(market_symbols, separators=(",", ":"))}
-        )
-        url = f"https://api.binance.com/api/v3/ticker/price?{params}"
+        url = "https://api.binance.com/api/v3/ticker/price"
         payload = http_json(url)
-        prices = {item["symbol"]: float(item["price"]) for item in payload}
+        allowed = set(market_symbols)
+        prices = {
+            item["symbol"]: float(item["price"])
+            for item in payload
+            if item.get("symbol") in allowed
+        }
         now = utc_now()
         snapshots: list[MarketSnapshot] = []
         for item in symbols:
@@ -366,6 +426,12 @@ class Store:
         ).fetchone()
         return int(row["count"]) if row else 0
 
+    def open_symbols(self) -> list[str]:
+        rows = self.db.execute(
+            "SELECT symbol FROM positions WHERE quantity > 0 ORDER BY symbol"
+        ).fetchall()
+        return [str(row["symbol"]) for row in rows]
+
 
 class Learner:
     def __init__(self, config: dict[str, Any]) -> None:
@@ -451,7 +517,7 @@ class PaperBroker:
         self.store = store
         self.config = config
 
-    def execute(self, snapshot: MarketSnapshot, decision: Decision) -> None:
+    def execute(self, snapshot: MarketSnapshot, decision: Decision) -> tuple[str, str]:
         cash = self.store.cash()
         quantity, avg_entry = self.store.position(snapshot.symbol)
         fee_rate = float(self.config.get("fee_rate", 0.001))
@@ -474,7 +540,7 @@ class PaperBroker:
                     decision.confidence,
                     "buy skipped: max open positions",
                 )
-                return
+                return "HOLD", "buy skipped: max open positions"
             budget = min(cash, max(0.0, target_position_value - position_value))
             if budget <= 1.0:
                 self.store.record_trade(
@@ -485,7 +551,7 @@ class PaperBroker:
                     decision.confidence,
                     "buy skipped: budget/risk cap",
                 )
-                return
+                return "HOLD", "buy skipped: budget/risk cap"
             fill_price = snapshot.price * (1.0 + slippage_rate)
             fee = budget * fee_rate
             bought = max(0.0, (budget - fee) / fill_price)
@@ -500,7 +566,7 @@ class PaperBroker:
             self.store.record_trade(
                 snapshot.symbol, "BUY", bought, fill_price, decision.confidence, decision.reason
             )
-            return
+            return "BUY", decision.reason
 
         if decision.action == "SELL":
             sell_quantity = quantity
@@ -508,7 +574,7 @@ class PaperBroker:
                 self.store.record_trade(
                     snapshot.symbol, "HOLD", 0.0, snapshot.price, decision.confidence, "sell skipped: no position"
                 )
-                return
+                return "HOLD", "sell skipped: no position"
             fill_price = snapshot.price * (1.0 - slippage_rate)
             proceeds = sell_quantity * fill_price
             fee = proceeds * fee_rate
@@ -522,11 +588,12 @@ class PaperBroker:
             self.store.record_trade(
                 snapshot.symbol, "SELL", sell_quantity, fill_price, decision.confidence, decision.reason
             )
-            return
+            return "SELL", decision.reason
 
         self.store.record_trade(
             snapshot.symbol, "HOLD", 0.0, snapshot.price, decision.confidence, decision.reason
         )
+        return "HOLD", decision.reason
 
 
 def parse_symbols(config: dict[str, Any]) -> list[SymbolConfig]:
@@ -540,7 +607,8 @@ def parse_symbols(config: dict[str, Any]) -> list[SymbolConfig]:
     ]
 
 
-def run_once(store: Store, feed: Any, learner: Learner, broker: PaperBroker, symbols: list[SymbolConfig]) -> None:
+def run_once(store: Store, feed: Any, learner: Learner, broker: PaperBroker, config: dict[str, Any]) -> None:
+    symbols = feed.universe(config, store) if hasattr(feed, "universe") else parse_symbols(config)
     snapshots = feed.prices(symbols)
     for snapshot in snapshots:
         store.insert_price(snapshot)
@@ -557,11 +625,11 @@ def run_once(store: Store, feed: Any, learner: Learner, broker: PaperBroker, sym
         )
         feature_set = learner.features(prices, quantity * snapshot.price, portfolio)
         decision = learner.decide(weights, feature_set, avg_entry, snapshot.price)
-        broker.execute(snapshot, decision)
+        executed_action, executed_reason = broker.execute(snapshot, decision)
         store.save_model(snapshot.symbol, weights, feature_set, snapshot.price)
         print(
             f"{snapshot.symbol:>5} {snapshot.price:>12.4f} "
-            f"{decision.action:<4} p_up={decision.confidence:.3f} {decision.reason}"
+            f"{executed_action:<4} p_up={decision.confidence:.3f} {executed_reason}"
         )
 
 
@@ -584,8 +652,7 @@ def main() -> int:
         random.seed(args.seed)
 
     config = load_config(args.config)
-    symbols = parse_symbols(config)
-    if not symbols:
+    if not parse_symbols(config) and config.get("universe", {}).get("mode") != "binance_top_volume":
         raise SystemExit("No symbols configured.")
 
     store = Store(args.db, config)
@@ -594,14 +661,14 @@ def main() -> int:
         return 0
 
     provider = config.get("market_data", {}).get("provider", "coingecko")
-    feed = BinanceFeed() if provider == "binance" else CoinGeckoFeed(config.get("quote_currency", "USD"))
+    feed = BinanceFeed(config.get("quote_currency", "USDT")) if provider == "binance" else CoinGeckoFeed(config.get("quote_currency", "USD"))
     learner = Learner(config)
     broker = PaperBroker(store, config)
 
     try:
         cycle = 0
         while True:
-            run_once(store, feed, learner, broker, symbols)
+            run_once(store, feed, learner, broker, config)
             print_summary(store)
             cycle += 1
             if args.once or (args.cycles is not None and cycle >= args.cycles):

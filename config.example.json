@@ -11,23 +11,33 @@
   "market_data": {
     "provider": "binance"
   },
-  "symbols": [
-    {
-      "id": "bitcoin",
-      "symbol": "BTC",
-      "market_symbol": "BTCUSDT"
-    },
-    {
-      "id": "ethereum",
-      "symbol": "ETH",
-      "market_symbol": "ETHUSDT"
-    },
-    {
-      "id": "solana",
-      "symbol": "SOL",
-      "market_symbol": "SOLUSDT"
-    }
-  ],
+  "universe": {
+    "mode": "binance_top_volume",
+    "top_n": 50,
+    "exclude_base_symbols": [
+      "USDC",
+      "FDUSD",
+      "TUSD",
+      "USDP",
+      "USDE",
+      "USD1",
+      "RLUSD",
+      "DAI",
+      "U",
+      "EUR",
+      "TRY",
+      "BRL",
+      "PAXG",
+      "XAUT"
+    ],
+    "exclude_suffixes": [
+      "UP",
+      "DOWN",
+      "BULL",
+      "BEAR"
+    ]
+  },
+  "symbols": [],
   "risk": {
     "min_confidence": 0.56,
     "stop_loss_pct": 0.15,
