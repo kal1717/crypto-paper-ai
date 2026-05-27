@@ -121,6 +121,10 @@ class CoinGeckoFeed:
             symbol = str(item.get("symbol", "")).upper()
             if not symbol or symbol in excluded:
                 continue
+            if "USD" in symbol:
+                continue
+            if safe_float(item.get("current_price")) > 1_000_000:
+                continue
             selected.append(
                 SymbolConfig(
                     coin_id=str(item.get("id", "")),
@@ -349,6 +353,36 @@ class Store:
                 last_price REAL,
                 updated_ts INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                requested_action TEXT NOT NULL,
+                executed_action TEXT NOT NULL,
+                price REAL NOT NULL,
+                confidence REAL NOT NULL,
+                reason TEXT NOT NULL,
+                features_json TEXT NOT NULL,
+                portfolio_value REAL NOT NULL,
+                position_value REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS decision_evaluations (
+                decision_id INTEGER NOT NULL,
+                horizon_seconds INTEGER NOT NULL,
+                future_ts INTEGER NOT NULL,
+                future_price REAL NOT NULL,
+                benchmark_symbol TEXT NOT NULL,
+                benchmark_return REAL NOT NULL,
+                forward_return REAL NOT NULL,
+                edge_return REAL NOT NULL,
+                score REAL NOT NULL,
+                label INTEGER NOT NULL,
+                used_for_training INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(decision_id, horizon_seconds),
+                FOREIGN KEY(decision_id) REFERENCES decisions(id)
+            );
             """
         )
         self.migrate()
@@ -518,6 +552,28 @@ class Store:
         )
         self.db.commit()
 
+    def save_model_weights(self, symbol: str, weights: dict[str, float]) -> None:
+        state = self.model_state(symbol)
+        self.db.execute(
+            """
+            INSERT INTO models(symbol, weights_json, last_feature_json, last_price, updated_ts)
+            VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(symbol) DO UPDATE SET
+                weights_json = excluded.weights_json,
+                updated_ts = excluded.updated_ts
+            """,
+            (
+                symbol,
+                json.dumps(weights, sort_keys=True),
+                json.dumps(state["last_features"], sort_keys=True)
+                if state["last_features"]
+                else None,
+                state["last_price"],
+                utc_now(),
+            ),
+        )
+        self.db.commit()
+
     def record_trade(
         self,
         symbol: str,
@@ -535,6 +591,163 @@ class Store:
             (utc_now(), symbol, action, quantity, price, self.cash(), confidence, reason),
         )
         self.db.commit()
+
+    def record_decision(
+        self,
+        symbol: str,
+        requested_action: str,
+        executed_action: str,
+        price: float,
+        confidence: float,
+        reason: str,
+        features: dict[str, float],
+        portfolio_value: float,
+        position_value: float,
+    ) -> None:
+        self.db.execute(
+            """
+            INSERT INTO decisions(
+                ts, symbol, requested_action, executed_action, price,
+                confidence, reason, features_json, portfolio_value, position_value
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                utc_now(),
+                symbol,
+                requested_action,
+                executed_action,
+                price,
+                confidence,
+                reason,
+                json.dumps(features, sort_keys=True),
+                portfolio_value,
+                position_value,
+            ),
+        )
+        self.db.commit()
+
+    def price_at_or_after(self, symbol: str, ts: int) -> sqlite3.Row | None:
+        return self.db.execute(
+            """
+            SELECT ts, price
+            FROM prices
+            WHERE symbol = ? AND ts >= ?
+            ORDER BY ts ASC, id ASC
+            LIMIT 1
+            """,
+            (symbol, ts),
+        ).fetchone()
+
+    def evaluate_decisions(
+        self,
+        horizons: tuple[int, ...] = (300, 900, 3600),
+        benchmark_symbol: str = "BTC",
+    ) -> int:
+        evaluated = 0
+        decisions = self.db.execute(
+            """
+            SELECT id, ts, symbol, executed_action, price
+            FROM decisions
+            ORDER BY id
+            """,
+        ).fetchall()
+        for decision in decisions:
+            for horizon in horizons:
+                exists = self.db.execute(
+                    """
+                    SELECT 1
+                    FROM decision_evaluations
+                    WHERE decision_id = ? AND horizon_seconds = ?
+                    """,
+                    (decision["id"], horizon),
+                ).fetchone()
+                if exists:
+                    continue
+                future = self.price_at_or_after(decision["symbol"], int(decision["ts"]) + horizon)
+                if future is None:
+                    continue
+                benchmark_entry = self.price_at_or_after(benchmark_symbol, int(decision["ts"]))
+                benchmark_future = self.price_at_or_after(
+                    benchmark_symbol, int(decision["ts"]) + horizon
+                )
+                if benchmark_entry is None or benchmark_future is None:
+                    benchmark_return = 0.0
+                else:
+                    benchmark_return = (
+                        float(benchmark_future["price"]) / float(benchmark_entry["price"])
+                    ) - 1.0
+                entry_price = float(decision["price"])
+                forward_return = (float(future["price"]) / entry_price) - 1.0 if entry_price > 0 else 0.0
+                edge_return = forward_return - benchmark_return
+                action = str(decision["executed_action"])
+                if action == "BUY":
+                    score = edge_return
+                elif action == "SELL":
+                    score = -edge_return
+                else:
+                    score = -abs(edge_return)
+                label = 1 if edge_return > 0.001 else 0
+                self.db.execute(
+                    """
+                    INSERT INTO decision_evaluations(
+                        decision_id, horizon_seconds, future_ts, future_price,
+                        benchmark_symbol, benchmark_return, forward_return,
+                        edge_return, score, label
+                    )
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        decision["id"],
+                        horizon,
+                        int(future["ts"]),
+                        float(future["price"]),
+                        benchmark_symbol,
+                        benchmark_return,
+                        forward_return,
+                        edge_return,
+                        score,
+                        label,
+                    ),
+                )
+                evaluated += 1
+        self.db.commit()
+        return evaluated
+
+    def train_from_evaluations(self, horizon_seconds: int = 900) -> int:
+        rows = self.db.execute(
+            """
+            SELECT e.decision_id, d.symbol, d.features_json, e.label
+            FROM decision_evaluations e
+            JOIN decisions d ON d.id = e.decision_id
+            WHERE e.horizon_seconds = ? AND e.used_for_training = 0
+            ORDER BY e.decision_id
+            """,
+            (horizon_seconds,),
+        ).fetchall()
+        learner = Learner(self.config)
+        trained = 0
+        for row in rows:
+            symbol = str(row["symbol"])
+            features = json.loads(row["features_json"])
+            state = self.model_state(symbol)
+            weights = learner.update_from_label(
+                state["weights"],
+                features,
+                int(row["label"]),
+            )
+            self.save_model_weights(symbol, weights)
+            self.db.execute(
+                """
+                UPDATE decision_evaluations
+                SET used_for_training = 1
+                WHERE decision_id = ? AND horizon_seconds = ?
+                """,
+                (row["decision_id"], horizon_seconds),
+            )
+            trained += 1
+        self.db.commit()
+        return trained
 
     def summary(self) -> dict[str, Any]:
         positions = self.db.execute(
@@ -591,6 +804,7 @@ class Store:
 
     def report(self) -> dict[str, Any]:
         summary = self.summary()
+        self.evaluate_decisions()
         trade_rows = self.db.execute(
             """
             SELECT ts, symbol, action, quantity, price, cash_after, confidence, reason
@@ -645,11 +859,75 @@ class Store:
         worst = min(round_trips, key=lambda item: item["pnl_pct"], default=None)
         buys = sum(1 for row in trade_rows if row["action"] == "BUY")
         sells = sum(1 for row in trade_rows if row["action"] == "SELL")
+        decision_count = int(
+            self.db.execute("SELECT COUNT(*) AS count FROM decisions").fetchone()["count"]
+        )
+        evaluated_count = int(
+            self.db.execute(
+                "SELECT COUNT(*) AS count FROM decision_evaluations"
+            ).fetchone()["count"]
+        )
+        trained_count = int(
+            self.db.execute(
+                "SELECT COUNT(*) AS count FROM decision_evaluations WHERE used_for_training = 1"
+            ).fetchone()["count"]
+        )
+        outcome_rows = self.db.execute(
+            """
+            SELECT
+                horizon_seconds,
+                COUNT(*) AS count,
+                AVG(edge_return) AS avg_edge_return,
+                AVG(score) AS avg_score,
+                AVG(label) AS positive_rate
+            FROM decision_evaluations
+            GROUP BY horizon_seconds
+            ORDER BY horizon_seconds
+            """
+        ).fetchall()
+        outcome_by_horizon = {
+            str(row["horizon_seconds"]): {
+                "count": int(row["count"]),
+                "avg_edge_return": float(row["avg_edge_return"] or 0.0),
+                "avg_score": float(row["avg_score"] or 0.0),
+                "positive_rate": float(row["positive_rate"] or 0.0),
+            }
+            for row in outcome_rows
+        }
+        action_rows = self.db.execute(
+            """
+            SELECT
+                d.executed_action,
+                e.horizon_seconds,
+                COUNT(*) AS count,
+                AVG(e.edge_return) AS avg_edge_return,
+                AVG(e.score) AS avg_score
+            FROM decision_evaluations e
+            JOIN decisions d ON d.id = e.decision_id
+            GROUP BY d.executed_action, e.horizon_seconds
+            ORDER BY d.executed_action, e.horizon_seconds
+            """
+        ).fetchall()
+        action_outcomes = [
+            {
+                "action": row["executed_action"],
+                "horizon_seconds": int(row["horizon_seconds"]),
+                "count": int(row["count"]),
+                "avg_edge_return": float(row["avg_edge_return"] or 0.0),
+                "avg_score": float(row["avg_score"] or 0.0),
+            }
+            for row in action_rows
+        ]
 
         return {
             "cash": summary["cash"],
             "portfolio_value": summary["portfolio_value"],
             "open_positions": summary["positions"],
+            "decision_count": decision_count,
+            "evaluated_decisions": evaluated_count,
+            "trained_evaluations": trained_count,
+            "outcomes_by_horizon_seconds": outcome_by_horizon,
+            "action_outcomes": action_outcomes,
             "trade_count": len(trade_rows),
             "buy_count": buys,
             "sell_count": sells,
@@ -759,6 +1037,19 @@ class Learner:
         error = target - prediction
         learning_rate = float(self.config.get("learning_rate", 0.08))
         for key, value in last_features.items():
+            weights[key] = weights.get(key, 0.0) + learning_rate * error * value
+        return weights
+
+    def update_from_label(
+        self,
+        weights: dict[str, float],
+        features: dict[str, float],
+        label: int,
+    ) -> dict[str, float]:
+        prediction = sigmoid(sum(weights.get(k, 0.0) * v for k, v in features.items()))
+        error = float(label) - prediction
+        learning_rate = float(self.config.get("learning_rate", 0.08))
+        for key, value in features.items():
             weights[key] = weights.get(key, 0.0) + learning_rate * error * value
         return weights
 
@@ -909,11 +1200,26 @@ def run_once(store: Store, feed: Any, learner: Learner, broker: PaperBroker, con
         feature_set = learner.features(rows, quantity * snapshot.price, portfolio)
         decision = learner.decide(weights, feature_set, avg_entry, snapshot.price)
         executed_action, executed_reason = broker.execute(snapshot, decision)
+        store.record_decision(
+            snapshot.symbol,
+            decision.action,
+            executed_action,
+            snapshot.price,
+            decision.confidence,
+            executed_reason,
+            feature_set,
+            portfolio,
+            quantity * snapshot.price,
+        )
         store.save_model(snapshot.symbol, weights, feature_set, snapshot.price)
         print(
             f"{snapshot.symbol:>5} {snapshot.price:>12.4f} "
             f"{executed_action:<4} p_up={decision.confidence:.3f} {executed_reason}"
         )
+    evaluated = store.evaluate_decisions()
+    trained = store.train_from_evaluations()
+    if evaluated or trained:
+        print(f"learning_update evaluated={evaluated} trained={trained}")
 
 
 def print_summary(store: Store) -> None:
@@ -922,6 +1228,8 @@ def print_summary(store: Store) -> None:
 
 
 def print_report(store: Store) -> None:
+    store.evaluate_decisions()
+    store.train_from_evaluations()
     print(json.dumps(store.report(), indent=2, sort_keys=True))
 
 

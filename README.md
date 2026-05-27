@@ -19,6 +19,9 @@ live-handel.
 - Lagrar pris, 24h-volym, 24h-forandring samt high/low for varje snapshot.
 - Lagger till features for momentum, volatilitet, RSI, volymforandring och
   var priset ligger i sitt 24h-intervall.
+- Sparar varje beslut med action, confidence, orsak och features.
+- Utvarderar beslut efter 5, 15 och 60 minuter mot BTC som enkel benchmark.
+- Tranar modellen vidare pa utvarderade 15-minutersbeslut.
 - Har riskregler for max 2 oppna positioner, 10% portfoljvarde per position,
   stop-loss pa -15% och take-profit.
 - Fortsatter bevaka oppna positioner aven om de tillfalligt hamnar utanfor topp
@@ -50,6 +53,15 @@ Visa handels- och larrapport:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\run.ps1 --report
 ```
+
+I rapporten betyder:
+
+- `decision_count`: hur manga beslut som sparats.
+- `evaluated_decisions`: hur manga beslut som hunnit fa facit efter 5/15/60 min.
+- `trained_evaluations`: hur manga facit som anvants for extra traning.
+- `outcomes_by_horizon_seconds`: om besluten slog eller tappade mot BTC efter
+  300, 900 och 3600 sekunder.
+- `action_outcomes`: om BUY, SELL och HOLD blev bra eller daliga per tidsfonster.
 
 ## Konfiguration
 
