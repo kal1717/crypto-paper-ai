@@ -1,19 +1,21 @@
 {
   "quote_currency": "USDT",
   "starting_cash": 100.0,
-  "position_fraction": 0.10,
+  "position_fraction": 0.04,
   "max_open_positions": 2,
   "fee_rate": 0.001,
   "slippage_rate": 0.0005,
   "poll_seconds": 60,
-  "exploration_rate": 0.12,
-  "learning_rate": 0.08,
+  "exploration_rate": 0.02,
+  "learning_rate": 0.04,
   "market_data": {
     "provider": "coingecko"
   },
   "universe": {
     "mode": "coingecko_top_volume",
-    "top_n": 50,
+    "top_n": 20,
+    "min_market_cap_usd": 500000000,
+    "min_total_volume_usd": 25000000,
     "exclude_base_symbols": [
       "USDT",
       "USDC",
@@ -49,8 +51,16 @@
   },
   "symbols": [],
   "risk": {
-    "min_confidence": 0.56,
-    "stop_loss_pct": 0.15,
-    "take_profit_pct": 0.08
+    "min_confidence": 0.62,
+    "stop_loss_pct": 0.05,
+    "take_profit_pct": 0.06,
+    "max_drawdown_pause_pct": 0.12
+  },
+  "strategy": {
+    "min_history_points": 20,
+    "min_ret_3_pct": 0.0,
+    "min_ret_8_pct": 0.0,
+    "min_market_change_24h": -0.03,
+    "max_range_position_24h": 0.35
   }
 }

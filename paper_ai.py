@@ -115,6 +115,8 @@ class CoinGeckoFeed:
 
         top_n = int(universe.get("top_n", 50))
         excluded = set(universe.get("exclude_base_symbols", []))
+        min_market_cap = float(universe.get("min_market_cap_usd", 0.0))
+        min_total_volume = float(universe.get("min_total_volume_usd", 0.0))
         markets = self.load_markets(top_n + len(excluded) + 20)
         selected: list[SymbolConfig] = []
         for item in markets:
@@ -124,6 +126,10 @@ class CoinGeckoFeed:
             if "USD" in symbol:
                 continue
             if safe_float(item.get("current_price")) > 1_000_000:
+                continue
+            if safe_float(item.get("market_cap")) < min_market_cap:
+                continue
+            if safe_float(item.get("total_volume")) < min_total_volume:
                 continue
             selected.append(
                 SymbolConfig(
@@ -512,6 +518,7 @@ class Store:
                     "range_position_24h": 0.0,
                     "volume_change_5": 0.0,
                     "market_change_24h": 0.0,
+                    "history_count": 0.0,
                     "position": 0.0,
                 },
                 "last_features": None,
@@ -1020,6 +1027,7 @@ class Learner:
             "market_change_24h": (float(latest["price_change_pct_24h"]) / 100.0)
             if latest
             else 0.0,
+            "history_count": float(len(prices)),
             "position": (position_value / portfolio) if portfolio > 0 else 0.0,
         }
 
@@ -1064,13 +1072,16 @@ class Learner:
         up_probability = sigmoid(score)
         exploration = float(self.config.get("exploration_rate", 0.12))
         risk = self.config.get("risk", {})
+        strategy = self.config.get("strategy", {})
         min_confidence = float(risk.get("min_confidence", 0.56))
         stop_loss_pct = float(risk.get("stop_loss_pct", 0.04))
         take_profit_pct = float(risk.get("take_profit_pct", 0.08))
 
         if random.random() < exploration:
-            action = random.choice(["BUY", "SELL", "HOLD"])
-            return Decision(action, up_probability, features, "exploration")
+            if avg_entry > 0:
+                action = random.choice(["SELL", "HOLD"])
+                return Decision(action, up_probability, features, "risk-only exploration")
+            return Decision("HOLD", up_probability, features, "exploration skipped: no random entries")
 
         if avg_entry > 0:
             change = (price / avg_entry) - 1.0
@@ -1080,6 +1091,16 @@ class Learner:
                 return Decision("SELL", up_probability, features, "take-profit")
 
         if up_probability >= min_confidence:
+            if features.get("history_count", 0.0) < float(strategy.get("min_history_points", 0)):
+                return Decision("HOLD", up_probability, features, "not enough history")
+            if features.get("ret_3", 0.0) < float(strategy.get("min_ret_3_pct", -999.0)):
+                return Decision("HOLD", up_probability, features, "entry blocked: weak 3-period momentum")
+            if features.get("ret_8", 0.0) < float(strategy.get("min_ret_8_pct", -999.0)):
+                return Decision("HOLD", up_probability, features, "entry blocked: weak 8-period momentum")
+            if features.get("market_change_24h", 0.0) < float(strategy.get("min_market_change_24h", -999.0)):
+                return Decision("HOLD", up_probability, features, "entry blocked: weak 24h market")
+            if features.get("range_position_24h", 0.0) > float(strategy.get("max_range_position_24h", 999.0)):
+                return Decision("HOLD", up_probability, features, "entry blocked: near 24h high")
             return Decision("BUY", up_probability, features, "model expects upside")
         if up_probability <= (1.0 - min_confidence):
             return Decision("SELL", up_probability, features, "model expects downside")
@@ -1103,8 +1124,22 @@ class PaperBroker:
         portfolio_value = float(summary["portfolio_value"])
         position_value = quantity * snapshot.price
         target_position_value = portfolio_value * position_fraction
+        risk = self.config.get("risk", {})
+        starting_cash = float(self.config.get("starting_cash", 100.0))
+        max_drawdown_pause_pct = float(risk.get("max_drawdown_pause_pct", 1.0))
+        pause_below_value = starting_cash * (1.0 - max_drawdown_pause_pct)
 
         if decision.action == "BUY":
+            if portfolio_value < pause_below_value:
+                self.store.record_trade(
+                    snapshot.symbol,
+                    "HOLD",
+                    0.0,
+                    snapshot.price,
+                    decision.confidence,
+                    "buy skipped: drawdown pause",
+                )
+                return "HOLD", "buy skipped: drawdown pause"
             if quantity <= 0 and self.store.open_position_count() >= max_open_positions:
                 self.store.record_trade(
                     snapshot.symbol,

@@ -14,16 +14,18 @@ live-handel.
 - Sparar priser, fiktiva affarer, portfolj och modellvikter i SQLite.
 - Borjar med 100 fiktiva USDT enligt `config.example.json`.
 - Gor sma kop/salj/hall-beslut med en enkel online-modell.
-- Blandar in lite utforskning sa den provar olika beslut och kan lara sig.
-- Skannar topp 50 kryptomarknader efter handelsvolym.
+- Blandar in minimal utforskning, men slumpen far inte oppna nya positioner.
+- Skannar topp 20 kryptomarknader efter handelsvolym, market cap och minsta
+  volym.
 - Lagrar pris, 24h-volym, 24h-forandring samt high/low for varje snapshot.
 - Lagger till features for momentum, volatilitet, RSI, volymforandring och
   var priset ligger i sitt 24h-intervall.
 - Sparar varje beslut med action, confidence, orsak och features.
 - Utvarderar beslut efter 5, 15 och 60 minuter mot BTC som enkel benchmark.
 - Tranar modellen vidare pa utvarderade 15-minutersbeslut.
-- Har riskregler for max 2 oppna positioner, 10% portfoljvarde per position,
-  stop-loss pa -15% och take-profit.
+- Har riskregler for max 2 oppna positioner, 4% portfoljvarde per position,
+  stop-loss pa -5% och take-profit.
+- Pausar nya kop om paper-portfoljen faller mer an den tillatna drawdown-gransen.
 - Fortsatter bevaka oppna positioner aven om de tillfalligt hamnar utanfor topp
   50-listan.
 
@@ -75,12 +77,13 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1 --config config.local.json
 Viktiga falt:
 
 - `starting_cash`: fiktivt startkapital.
-- `trade_fraction`: hur stor del av kassan eller positionen som handlas per beslut.
-- `max_position_fraction`: max andel av portfoljen i ett enskilt mynt.
+- `position_fraction`: hur stor del av portfoljen en ny position far vara.
+- `max_open_positions`: max antal oppna positioner samtidigt.
 - `exploration_rate`: hur ofta agenten testar slumpmassiga beslut for att lara sig.
 - `learning_rate`: hur snabbt modellen justerar sig efter nya prisrorelser.
 - `symbols`: CoinGecko-id och kort symbol for marknader att bevaka.
 - `universe.top_n`: hur manga marknader som ska skannas.
+- `risk.max_drawdown_pause_pct`: nar nya kop ska pausas efter for stor nedgang.
 
 ## Vagen mot live-handel
 
